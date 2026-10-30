@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "domain_enums": {
+    "SecurityProtocolType": ["OPEN", "WEP", "WPA_PSK", "WPA2_PSK", "WPA3_SAE", "ENTERPRISE", "UNKNOWN"],
+    "CheckStatusType": [
+      "MATCH",
+      "MISMATCH",
+      "TIMEOUT",
+      "ERROR",
+      "NOT_APPLICABLE",
+      "NOT_DETECTED",
+      "PORTAL_DETECTED",
+      "VALID_CERT",
+      "INVALID_CERT"
+    ],
+    "VerdictType": ["NO_DISCREPANCIES", "ATTENTION_REQUIRED", "INCOMPLETE"],
+    "LocalSyncStatus": ["PENDING", "IN_FLIGHT", "SYNCED", "FAILED_PERMANENT"]
+  },
+  "state_machines": {
+    "wifi_check_lifecycle": {
+      "initial_state": "IDLE",
+      "states": {
+        "IDLE": {
+          "on_user_trigger": "RUNNING"
+        },
+        "RUNNING": {
+          "on_all_probes_finished": "COMPLETED",
+          "on_wifi_disconnected_or_ssid_changed": "INTERRUPTED"
+        },
+        "INTERRUPTED": {
+          "rule": "Cancela corrutinas activas, descarta resultados parciales y nunca guarda la revisión como aprobada.",
+          "on_user_retry": "RUNNING"
+        },
+        "COMPLETED": {
+          "rule": "Persiste en Room (network_checks + check_signals) con sync_status = PENDING.",
+          "on_new_check": "RUNNING"
+        }
+      }
+    },
+    "telemetry_sync_lifecycle": {
+      "initial_state": "PENDING",
+      "transitions": [
+        {
+          "from": "PENDING",
+          "to": "IN_FLIGHT",
+          "trigger": "WorkManager selecciona registro y asigna sync_batch_id (UUID v7)."
+        },
+        {
+          "from": "IN_FLIGHT",
+          "to": "SYNCED",
+          "trigger": "API responde HTTP 200 OK (insertado o ignorado por idempotencia)."
+        },
+        {
+          "from": "IN_FLIGHT",
+          "to": "PENDING",
+          "trigger": "Fallo de transporte, timeout o HTTP 5xx/429 (reintento con backoff exponencial)."
+        },
+        {
+          "from": "IN_FLIGHT",
+          "to": "FAILED_PERMANENT",
+          "trigger": "HTTP 400/422 (error de validación irreparable) o sync_attempts >= 10."
+        }
+      ]
+    }
+  },
+  "entity_mapping_local_to_remote": [
+    {
+      "entity": "NetworkCheck",
+      "local_sqlite_table": "network_checks",
+      "remote_postgres_table": "network_checks",
+      "primary_key": "check_id (UUID v7 generado en móvil)",
+      "idempotency_mechanism": "ON CONFLICT (check_id) DO NOTHING",
+      "privacy_constraints": [
+        "network_pseudonym es HMAC-SHA256(BSSID, KeystoreSecret) de 64 chars",
+        "Jamás contiene SSID, BSSID ni coordenadas GPS"
+      ]
+    },
+    {
+      "entity": "CheckSignal",
+      "local_sqlite_table": "check_signals",
+      "remote_postgres_table": "check_signals",
+      "primary_key": "signal_id (UUID v7 generado en móvil)",
+      "foreign_key": "check_id -> network_checks.check_id",
+      "idempotency_mechanism": "Insertado atómicamente en la misma transacción que su NetworkCheck padre"
+    },
+    {
+      "entity": "HoneypotSession",
+      "local_sqlite_table": "honeypot_sessions",
+      "remote_postgres_table": "honeypot_sessions",
+      "primary_key": "session_id (UUID v7 generado en móvil)",
+      "anti_flood_controls": {
+        "max_unique_events_per_session": 200,
+        "overflow_behavior": "Incrementa dropped_events_count en honeypot_sessions sin hacer INSERT en honeypot_events"
+      }
+    },
+    {
+      "entity": "HoneypotEvent",
+      "local_sqlite_table": "honeypot_events",
+      "remote_postgres_table": "honeypot_events (Particionada por occurred_at)",
+      "primary_key_local": "event_id (UUID v7)",
+      "primary_key_remote": "(occurred_at, event_id)",
+      "idempotency_key": "idempotency_hash = SHA-256(session_id + source_ip_masked + http_method + request_path)",
+      "idempotency_mechanism": "Local: Upsert incrementando hit_count. Remoto: ON CONFLICT (occurred_at, idempotency_hash) DO NOTHING"
+    }
+  ],
+  "api_endpoints_contract_summary": [
+    {
+      "id": "EP_ENROLL_DEVICE",
+      "method": "POST",
+      "path": "/api/v1/devices/enroll",
+      "auth": "OPTIONAL_BEARER_JWT",
+      "phase": 4,
+      "request_fields": ["app_platform", "client_version"],
+      "response_fields": ["device_id", "device_api_key", "enrolled_at"]
+    },
+    {
+      "id": "EP_REVOKE_DEVICE",
+      "method": "POST",
+      "path": "/api/v1/devices/{device_id}/revoke",
+      "auth": "X_DEVICE_TOKEN_OR_JWT",
+      "phase": 4
+    },
+    {
+      "id": "EP_SYNC_CHECKS",
+      "method": "POST",
+      "path": "/api/v1/sync/network-checks",
+      "auth": "X_DEVICE_TOKEN",
+      "max_payload_kb": 64,
+      "max_batch_items": 100,
+      "phase": 4
+    },
+    {
+      "id": "EP_SYNC_HONEYPOT",
+      "method": "POST",
+      "path": "/api/v1/sync/honeypot-events",
+      "auth": "X_DEVICE_TOKEN",
+      "max_payload_kb": 64,
+      "max_batch_items": 200,
+      "phase": 4
+    },
+    {
+      "id": "EP_CANARY_PROBE",
+      "method": "GET",
+      "path": "/api/v1/canary/probe",
+      "auth": "PUBLIC",
+      "phase": 1,
+      "description": "Usado durante la prueba activa HTTPS de la app para validar la cadena TLS con el TrustManager de Android."
+    }
+  ]
+}

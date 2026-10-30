@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "graph_metadata": {
+    "project_name": "HoneyPhone",
+    "version": "1.0.0",
+    "description": "Grafo de conocimiento de arquitectura, componentes, reglas de negocio y fases de desarrollo para ingesta por agentes de IA.",
+    "implementation_strategy": "OFFLINE_FIRST_API_LAST",
+    "critical_notice": "La app Android debe funcionar 100% sin backend durante las Fases 1 a 3. La sincronizacion con la API REST es opcional, diferida y corresponde a la Fase 4."
+  },
+  "nodes": [
+    {
+      "id": "NODE_ANDROID_APP",
+      "type": "SYSTEM_CONTAINER",
+      "name": "HoneyPhone Android Client",
+      "technology": ["Kotlin", "Jetpack Compose", "Coroutines", "StateFlow", "Hilt", "WorkManager"],
+      "architecture_pattern": "Feature-First + MVI (Unidirectional Data Flow) + Room SSOT",
+      "phase": 1
+    },
+    {
+      "id": "NODE_WIFI_CHECKER_ENGINE",
+      "type": "ENGINE_MODULE",
+      "name": "WifiCheckerEngine",
+      "responsibilities": [
+        "Obtener instancia android.net.Network con NetworkCapabilities.TRANSPORT_WIFI",
+        "Vincular todas las sondas DNS y HTTPS a la interfaz Wi-Fi mediante Network.bindSocket()",
+        "Leer tipo de seguridad (WPA2/WPA3/OPEN) con degradación elegante si falta permiso",
+        "Detectar portal cautivo reportado por Android",
+        "Comparar resolución DNS del sistema vs DNS-over-HTTPS (DoH) sobre dominio controlado",
+        "Validar certificado TLS contra endpoint canario usando el TrustManager del sistema"
+      ],
+      "enforces_rules": ["RN-01", "RN-02", "RN-03", "RN-04", "RN-05"],
+      "phase": 1
+    },
+    {
+      "id": "NODE_HONEYPOT_SERVICE",
+      "type": "ENGINE_MODULE",
+      "name": "HoneypotForegroundService & TcpDecoyServer",
+      "responsibilities": [
+        "Ejecutar servicio en primer plano con notificación visible persistente",
+        "Abrir ServerSocket en puerto TCP 8080 apagado por defecto",
+        "Limitar concurrencia con Semaphore(3) y SO_TIMEOUT de 2500ms",
+        "Leer máximo 2048 bytes para extraer Method, Path y User-Agent, descartando credenciales o body",
+        "Enmascarar IP de origen a /24 (IPv4) o /64 (IPv6) antes de persistir"
+      ],
+      "enforces_rules": ["RN-02", "RN-06"],
+      "phase": 3
+    },
+    {
+      "id": "NODE_KEYSTORE_PSEUDONYMIZER",
+      "type": "SECURITY_COMPONENT",
+      "name": "NetworkPseudonymizer & KeystoreManager",
+      "responsibilities": [
+        "Mantener clave secreta HMAC dentro de Android Keystore (Hardware-backed TEE)",
+        "Generar network_pseudonym de 64 chars vía HMAC-SHA256(BSSID) sin guardar jamás el BSSID/SSID en claro",
+        "Proveer clave de cifrado para SQLCipher"
+      ],
+      "enforces_rules": ["RN-02"],
+      "phase": 2
+    },
+    {
+      "id": "NODE_LOCAL_DB",
+      "type": "DATABASE_CONTAINER",
+      "name": "Room / SQLite + SQLCipher (Local SSOT)",
+      "technology": ["Room", "SQLite", "SQLCipher"],
+      "pragmas": ["foreign_keys=ON", "journal_mode=WAL", "synchronous=NORMAL", "secure_delete=ON"],
+      "responsibilities": [
+        "Actuar como Única Fuente de Verdad (SSOT) reactiva mediante Kotlin Flows",
+        "Imponer deduplicación en caliente (hit_count) y cuota máxima de 200 eventos únicos por sesión",
+        "Gestionar máquina de estados de sincronización (PENDING, IN_FLIGHT, SYNCED, FAILED_PERMANENT)"
+      ],
+      "phase": 2
+    },
+    {
+      "id": "NODE_SYNC_GATEWAY",
+      "type": "INTEGRATION_BOUNDARY",
+      "name": "TelemetrySyncGateway & TelemetrySyncWorker",
+      "responsibilities": [
+        "Abstraer la comunicación con la API mediante interfaz (LocalOnlySyncGateway en Fases 1-3, RemoteApiSyncGateway en Fase 4)",
+        "Empaquetar lotes pendientes con UUID v7 y enviarlos de forma asíncrona con Backoff Exponencial",
+        "Aislar registros corruptos (FAILED_PERMANENT) para evitar Head-of-Line Blocking"
+      ],
+      "phase": 4
+    },
+    {
+      "id": "NODE_FASTAPI_BACKEND",
+      "type": "SYSTEM_CONTAINER",
+      "name": "HoneyPhone REST API",
+      "technology": ["Python 3.12+", "FastAPI", "Pydantic v2", "SQLAlchemy 2.0 Async", "asyncpg"],
+      "architecture_pattern": "Modular Layered by Feature (devices, checks, honeypot, canary)",
+      "responsibilities": [
+        "Autenticar dispositivos mediante SHA-256(X-Device-Token) sin exigir cuenta de usuario nominal",
+        "Rechazar payloads mayores a 64 KB (HTTP 413)",
+        "Sanitizar rutas y asegurar máscara CIDR en frontera",
+        "Ejecutar inserciones por lotes idempotentes (ON CONFLICT DO NOTHING)"
+      ],
+      "phase": 4
+    },
+    {
+      "id": "NODE_POSTGRES_DB",
+      "type": "DATABASE_CONTAINER",
+      "name": "PostgreSQL 16+ Central Telemetry DB",
+      "technology": ["PostgreSQL 16+", "pgcrypto", "Declarative Range Partitioning"],
+      "responsibilities": [
+        "Persistir dispositivos enrolados (user_id opcional)",
+        "Almacenar revisiones y señales con claves UUID v7 para evitar fragmentación B-Tree",
+        "Particionar honeypot_events mensualmente por occurred_at"
+      ],
+      "phase": 4
+    }
+  ],
+  "edges": [
+    {
+      "source": "NODE_WIFI_CHECKER_ENGINE",
+      "target": "NODE_KEYSTORE_PSEUDONYMIZER",
+      "relationship": "REQUESTS_PSEUDONYM",
+      "description": "Transforma el BSSID activo en un hash HMAC-SHA256 en memoria y descarta el BSSID."
+    },
+    {
+      "source": "NODE_WIFI_CHECKER_ENGINE",
+      "target": "NODE_LOCAL_DB",
+      "relationship": "WRITES_CHECK_AND_SIGNALS",
+      "description": "Inserta transaccionalmente network_checks y check_signals con sync_status=PENDING."
+    },
+    {
+      "source": "NODE_HONEYPOT_SERVICE",
+      "target": "NODE_LOCAL_DB",
+      "relationship": "UPSERTS_DECOY_EVENTS",
+      "description": "Registra sesiones y aplica upsert en honeypot_events incrementando hit_count si idempotency_hash ya existe."
+    },
+    {
+      "source": "NODE_LOCAL_DB",
+      "target": "NODE_ANDROID_APP",
+      "relationship": "EMITS_REACTIVE_FLOWS",
+      "description": "Notifica a los ViewModels de Compose cualquier cambio en revisiones o impactos del señuelo."
+    },
+    {
+      "source": "NODE_SYNC_GATEWAY",
+      "target": "NODE_LOCAL_DB",
+      "relationship": "POLLS_AND_UPDATES_SYNC_STATE",
+      "description": "Lee lotes PENDING, los marca IN_FLIGHT con sync_batch_id y finalmente los pasa a SYNCED."
+    },
+    {
+      "source": "NODE_SYNC_GATEWAY",
+      "target": "NODE_FASTAPI_BACKEND",
+      "relationship": "SYNC_BATCH_OVER_HTTPS",
+      "description": "[Fase 4] Envía lotes JSON firmados con X-Device-Token hacia /api/v1/sync/*."
+    },
+    {
+      "source": "NODE_FASTAPI_BACKEND",
+      "target": "NODE_POSTGRES_DB",
+      "relationship": "IDEMPOTENT_BATCH_INSERT",
+      "description": "[Fase 4] Persiste telemetría con cláusulas ON CONFLICT DO NOTHING."
+    }
+  ]
+}
